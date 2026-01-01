@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Service principal : l'application IA
+  ia-reunions:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # Nom du conteneur pour le retrouver facilement
+    container_name: ia-reunions-app
+    
+    # ====== SUPPORT GPU NVIDIA ======
+    # Permet d'utiliser ta RTX 4070 Ti dans le conteneur
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Utilise tous les GPU disponibles (1 dans ton cas)
+              capabilities: [gpu]
+    
+    # ====== PORTS ======
+    # Expose le port 8000 pour accéder à l'API FastAPI
+    ports:
+      - "8001:8000"
+    
+    # ====== VOLUMES ======
+    # Monte ton code local dans le conteneur = modification en temps réel !
+    volumes:
+      - .:/app
+      # Cache pip pour éviter de retélécharger les packages à chaque rebuild
+      - pip-cache:/root/.cache/pip
+      # Dossier de sauvegarde des transcriptions
+      - ./transcriptions:/app/transcriptions
+    
+    # ====== VARIABLES D'ENVIRONNEMENT ======
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Optionnel : définit le modèle Whisper par défaut
+      - WHISPER_MODEL=base
+      # Pour le debug
+      - LOG_LEVEL=INFO
+    
+    # ====== COMMANDE DE DÉVELOPPEMENT ======
+    # Uvicorn avec --reload : redémarre automatiquement quand tu modifies le code
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    
+    # Redémarre automatiquement en cas de crash
+    restart: unless-stopped
+
+# Volume persistant pour le cache pip
+volumes:
+  pip-cache:
