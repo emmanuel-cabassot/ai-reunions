@@ -1,12 +1,16 @@
 # 🎙️ IA Réunions
 
-API de transcription audio intelligente utilisant **Whisper** (OpenAI) pour la transcription et **NeMo** (NVIDIA) pour la diarisation (identification des locuteurs).
+API de transcription audio intelligente utilisant **WhisperX** pour la transcription et la diarisation (identification des locuteurs).
+
+> [!IMPORTANT]
+> **Vision Fin 2025** : Optimisé pour une exécution locale sous contrainte de **12 Go de VRAM**. Voir la documentation [ARCHITECTURE.md](file:///home/cabassot/ia_reunions/ARCHITECTURE.md).
 
 Transformez vos enregistrements de réunions en texte avec :
 - 🎯 Détection automatique de la langue
 - 👥 Identification des locuteurs (Speaker 1, Speaker 2, etc.)
 - ⏱️ Horodatage précis des segments
 - 💾 Sauvegarde automatique des transcriptions
+- 🚀 Optimisé pour GPU NVIDIA (WhisperX avec diarisation intégrée)
 
 ---
 
@@ -36,7 +40,7 @@ cd ia_reunions
 ### 2. Lancer l'application
 
 ```bash
-# Build et démarre le conteneur (première fois : 10-15 min avec NeMo)
+# Build et démarre le conteneur (première fois : 5-10 min)
 docker compose up --build
 ```
 
@@ -172,8 +176,8 @@ Le code est monté en volume, les modifications sont appliquées automatiquement
 
 | Composant | Licence | Usage commercial |
 |-----------|---------|------------------|
-| Whisper (OpenAI) | MIT | ✅ Libre |
-| NeMo (NVIDIA) | Apache 2.0 | ✅ Libre |
+| WhisperX | BSD-4-Clause | ✅ Libre |
+| pyannote-audio | MIT | ✅ Libre |
 | FastAPI | MIT | ✅ Libre |
 
 ---

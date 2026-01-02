@@ -1,54 +1,58 @@
 version: '3.8'
 
 services:
-  # Service principal : l'application IA
-  ia-reunions:
+  # Service principal : API de transcription audio avec WhisperX
+  whisper-api:
     build:
       context: .
       dockerfile: Dockerfile
-    
-    # Nom du conteneur pour le retrouver facilement
-    container_name: ia-reunions-app
-    
+
+    # Nom du conteneur
+    container_name: whisper-api
+
     # ====== SUPPORT GPU NVIDIA ======
-    # Permet d'utiliser ta RTX 4070 Ti dans le conteneur
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all  # Utilise tous les GPU disponibles (1 dans ton cas)
-              capabilities: [gpu]
-    
+              count: all
+              capabilities: [ gpu ]
+
+    # ====== MÉMOIRE PARTAGÉE ======
+    shm_size: '2gb'
+
     # ====== PORTS ======
-    # Expose le port 8000 pour accéder à l'API FastAPI
     ports:
       - "8001:8000"
-    
+
     # ====== VOLUMES ======
-    # Monte ton code local dans le conteneur = modification en temps réel !
     volumes:
       - .:/app
-      # Cache pip pour éviter de retélécharger les packages à chaque rebuild
       - pip-cache:/root/.cache/pip
-      # Dossier de sauvegarde des transcriptions
       - ./transcriptions:/app/transcriptions
-    
+      # Cache Hugging Face pour les modèles pyannote
+      - hf-cache:/root/.cache/huggingface
+
     # ====== VARIABLES D'ENVIRONNEMENT ======
     environment:
       - PYTHONUNBUFFERED=1
-      # Optionnel : définit le modèle Whisper par défaut
-      - WHISPER_MODEL=base
-      # Pour le debug
+      # Modèle Whisper à utiliser (tiny, base, small, medium, large-v3)
+      - WHISPER_MODEL=medium
+      # Token Hugging Face pour pyannote (OBLIGATOIRE pour la diarisation)
+      # Obtenez-le sur https://huggingface.co/settings/tokens
+      # et acceptez les conditions sur https://huggingface.co/pyannote/speaker-diarization-3.1
+      - HF_TOKEN=${HF_TOKEN}
+      # Niveau de log
       - LOG_LEVEL=INFO
-    
-    # ====== COMMANDE DE DÉVELOPPEMENT ======
-    # Uvicorn avec --reload : redémarre automatiquement quand tu modifies le code
+
+    # ====== COMMANDE ======
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    
+
     # Redémarre automatiquement en cas de crash
     restart: unless-stopped
 
-# Volume persistant pour le cache pip
+# Volumes persistants
 volumes:
   pip-cache:
+  hf-cache:

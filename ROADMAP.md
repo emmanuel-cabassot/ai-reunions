@@ -7,17 +7,17 @@ Liste des améliorations potentielles pour IA Réunions.
 ## 🎤 Diarisation & Reconnaissance de Locuteurs
 
 ### ✅ Diarisation basique (Speaker 1, Speaker 2, etc.) - IMPLÉMENTÉ
-- **Outil utilisé** : NeMo (NVIDIA) avec TitaNet
-- **Licence** : Apache 2.0 ✅ Commercial OK
+- **Outil utilisé** : WhisperX avec pyannote-audio
+- **Licence** : BSD-4-Clause (WhisperX) + MIT (pyannote) ✅ Commercial OK
 - **Sortie** : Segments avec identification `SPEAKER_00`, `SPEAKER_01`, etc.
 - **Endpoint** : `POST /transcribe` avec `diarize=true` (par défaut)
 
 ### Reconnaissance de locuteurs (avec BDD)
 - **Concept** : Enrôler des personnes avec ~30 sec de leur voix
 - **Outils** : 
+  - pyannote/embedding (MIT) ✅
   - SpeechBrain (Apache 2.0) ✅
   - Resemblyzer (Apache 2.0) ✅
-  - NeMo TitaNet (Apache 2.0) ✅
 - **Stockage** : PostgreSQL avec pgvector ou SQLite
 - **Workflow** :
   1. `POST /speakers/enroll` → Enregistrer un locuteur avec son nom + audio

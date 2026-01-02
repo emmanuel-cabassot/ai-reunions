@@ -1,7 +1,7 @@
 """
 🎙️ IA Réunions - API de Transcription Audio avec Diarisation
 =============================================================
-Utilise Whisper (OpenAI) pour transcrire et NeMo (NVIDIA) pour identifier les locuteurs.
+Utilise WhisperX pour la transcription et pyannote pour la diarisation.
 """
 
 import os
@@ -11,18 +11,25 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict
-import subprocess
 
-import whisper
 import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from loguru import logger
 
+# ====== FIX PYTORCH 2.6+ COMPATIBILITY ======
+# PyTorch 2.6+ a changé weights_only=True par défaut, ce qui casse pyannote
+# On force weights_only=False pour les modèles de confiance (pyannote, whisperx)
+_torch_load_original = torch.load
+def _torch_load_patched(*args, **kwargs):
+    kwargs['weights_only'] = False  # Force toujours False
+    return _torch_load_original(*args, **kwargs)
+torch.load = _torch_load_patched
 # ====== CONFIGURATION ======
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/transcriptions"))
 ENABLE_DIARIZATION = os.getenv("ENABLE_DIARIZATION", "true").lower() == "true"
+HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 # Création du dossier de sortie
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,167 +37,111 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ====== INITIALISATION ======
 app = FastAPI(
     title="IA Réunions",
-    description="API de transcription audio avec Whisper et diarisation NeMo",
-    version="2.0.0"
+    description="API de transcription audio avec WhisperX et diarisation pyannote",
+    version="3.0.0"
 )
 
 # Détection GPU
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 GPU_NAME = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
 
-# Chargement du modèle Whisper au démarrage
-logger.info(f"🔄 Chargement du modèle Whisper '{WHISPER_MODEL}' sur {DEVICE}...")
-whisper_model = whisper.load_model(WHISPER_MODEL, device=DEVICE)
-logger.success(f"✅ Modèle Whisper '{WHISPER_MODEL}' chargé avec succès sur {DEVICE} !")
+# Chargement de WhisperX au démarrage
+whisperx_model = None
+align_model = None
+align_metadata = None
+diarize_model = None
 
-# Chargement du modèle NeMo pour la diarisation
-nemo_diarizer = None
-if ENABLE_DIARIZATION:
-    try:
-        from nemo.collections.asr.models import ClusteringDiarizer
-        logger.info("🔄 Chargement du modèle NeMo pour la diarisation...")
-        # Le modèle sera initialisé à la demande pour économiser la mémoire
-        logger.success("✅ NeMo diarization disponible !")
-    except ImportError as e:
-        logger.warning(f"⚠️ NeMo non disponible, diarisation désactivée: {e}")
-        ENABLE_DIARIZATION = False
-
-
-def run_diarization(audio_path: str) -> List[Dict]:
-    """
-    Exécute la diarisation avec NeMo.
-    Retourne une liste de segments avec speaker_id.
-    """
-    try:
-        from omegaconf import OmegaConf
-        from nemo.collections.asr.models import ClusteringDiarizer
-        
-        # Créer un dossier temporaire pour NeMo
-        temp_dir = tempfile.mkdtemp()
-        manifest_path = os.path.join(temp_dir, "manifest.json")
-        output_dir = os.path.join(temp_dir, "output")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Créer le manifest pour NeMo
-        manifest_entry = {
-            "audio_filepath": audio_path,
-            "offset": 0,
-            "duration": None,
-            "label": "infer",
-            "text": "-",
-            "num_speakers": None,  # Auto-detect
-            "rttm_filepath": None,
-            "uem_filepath": None
-        }
-        
-        with open(manifest_path, "w") as f:
-            json.dump(manifest_entry, f)
-            f.write("\n")
-        
-        # Configuration NeMo
-        config = OmegaConf.create({
-            "diarizer": {
-                "manifest_filepath": manifest_path,
-                "out_dir": output_dir,
-                "oracle_vad": False,
-                "collar": 0.25,
-                "ignore_overlap": True,
-                "vad": {
-                    "model_path": "vad_multilingual_marblenet",
-                    "parameters": {
-                        "onset": 0.8,
-                        "offset": 0.6,
-                        "min_duration_on": 0.1,
-                        "min_duration_off": 0.1,
-                    }
-                },
-                "speaker_embeddings": {
-                    "model_path": "titanet_large",
-                    "parameters": {
-                        "window_length_in_sec": 1.5,
-                        "shift_length_in_sec": 0.75,
-                        "multiscale_weights": [1, 1, 1, 1, 1]
-                    }
-                },
-                "clustering": {
-                    "parameters": {
-                        "oracle_num_speakers": False,
-                        "max_num_speakers": 8,
-                        "enhanced_count_thres": 80,
-                        "max_rp_threshold": 0.25,
-                        "sparse_search_volume": 30
-                    }
-                }
-            }
-        })
-        
-        # Initialiser et exécuter le diarizer
-        diarizer = ClusteringDiarizer(cfg=config)
-        diarizer.diarize()
-        
-        # Lire les résultats RTTM
-        rttm_file = os.path.join(output_dir, "pred_rttms", 
-                                  os.path.basename(audio_path).replace(
-                                      os.path.splitext(audio_path)[1], ".rttm"))
-        
-        diarization_segments = []
-        if os.path.exists(rttm_file):
-            with open(rttm_file, "r") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 8:
-                        start = float(parts[3])
-                        duration = float(parts[4])
-                        speaker = parts[7]
-                        diarization_segments.append({
-                            "start": start,
-                            "end": start + duration,
-                            "speaker": speaker
-                        })
-        
-        # Nettoyage
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        
-        return diarization_segments
-        
-    except Exception as e:
-        logger.error(f"Erreur diarisation: {e}")
-        return []
-
-
-def merge_transcription_with_diarization(
-    whisper_segments: List[Dict], 
-    diarization_segments: List[Dict]
-) -> List[Dict]:
-    """
-    Fusionne les segments Whisper avec les informations de diarisation.
-    """
-    if not diarization_segments:
-        # Pas de diarisation, retourner les segments originaux
-        return [{"speaker": "SPEAKER_00", **seg} for seg in whisper_segments]
+def load_models():
+    """Charge les modèles WhisperX et pyannote."""
+    global whisperx_model, align_model, align_metadata, diarize_model
     
-    merged = []
-    for seg in whisper_segments:
-        seg_start = seg["start"]
-        seg_end = seg["end"]
-        seg_mid = (seg_start + seg_end) / 2
-        
-        # Trouver le speaker qui parle au milieu du segment
-        speaker = "UNKNOWN"
-        for diar_seg in diarization_segments:
-            if diar_seg["start"] <= seg_mid <= diar_seg["end"]:
-                speaker = diar_seg["speaker"]
-                break
-        
-        merged.append({
-            "speaker": speaker,
-            "start": seg_start,
-            "end": seg_end,
-            "text": seg["text"]
-        })
+    import whisperx
     
-    return merged
+    # 1. Modèle de transcription WhisperX
+    logger.info(f"🔄 Chargement du modèle WhisperX '{WHISPER_MODEL}' sur {DEVICE}...")
+    whisperx_model = whisperx.load_model(
+        WHISPER_MODEL, 
+        device=DEVICE, 
+        compute_type=COMPUTE_TYPE
+    )
+    logger.success(f"✅ Modèle WhisperX '{WHISPER_MODEL}' chargé !")
+    
+    # 2. Modèle de diarisation (si token HF disponible)
+    if ENABLE_DIARIZATION and HF_TOKEN:
+        logger.info("🔄 Chargement du modèle de diarisation pyannote...")
+        try:
+            from whisperx.diarize import DiarizationPipeline
+            diarize_model = DiarizationPipeline(
+                use_auth_token=HF_TOKEN,
+                device=DEVICE
+            )
+            logger.success("✅ Modèle de diarisation pyannote chargé !")
+        except Exception as e:
+            logger.error(f"❌ Erreur chargement diarisation: {e}")
+            logger.warning("⚠️ Diarisation désactivée")
+    elif ENABLE_DIARIZATION and not HF_TOKEN:
+        logger.warning("⚠️ HF_TOKEN non défini - Diarisation désactivée")
+        logger.info("💡 Définissez HF_TOKEN dans docker-compose.yml pour activer la diarisation")
+
+# Charger les modèles au démarrage
+load_models()
+
+
+def transcribe_with_whisperx(audio_path: str, diarize: bool = True) -> Dict:
+    """
+    Transcrit un fichier audio avec WhisperX.
+    Retourne la transcription avec alignement et diarisation.
+    """
+    import whisperx
+    
+    # 1. Charger l'audio
+    audio = whisperx.load_audio(audio_path)
+    
+    # 2. Transcription
+    logger.info(f"🎵 Transcription en cours sur {DEVICE}...")
+    result = whisperx_model.transcribe(audio, batch_size=16)
+    detected_language = result["language"]
+    logger.info(f"📝 Langue détectée: {detected_language}")
+    
+    # 3. Alignement (word-level timestamps)
+    logger.info("🔄 Alignement des mots...")
+    global align_model, align_metadata
+    
+    # Charger le modèle d'alignement pour cette langue
+    align_model, align_metadata = whisperx.load_align_model(
+        language_code=detected_language, 
+        device=DEVICE
+    )
+    result = whisperx.align(
+        result["segments"], 
+        align_model, 
+        align_metadata, 
+        audio, 
+        DEVICE,
+        return_char_alignments=False
+    )
+    
+    # 4. Diarisation (si activée et disponible)
+    speakers_detected = []
+    if diarize and diarize_model is not None:
+        logger.info("🎤 Diarisation en cours...")
+        diarize_segments = diarize_model(audio)
+        result = whisperx.assign_word_speakers(diarize_segments, result)
+        
+        # Extraire les locuteurs uniques
+        speakers_detected = list(set(
+            seg.get("speaker", "SPEAKER_00") 
+            for seg in result["segments"] 
+            if seg.get("speaker")
+        ))
+        speakers_detected.sort()
+    
+    return {
+        "segments": result["segments"],
+        "language": detected_language,
+        "speakers": speakers_detected if speakers_detected else ["SPEAKER_00"]
+    }
 
 
 # ====== ROUTES ======
@@ -204,21 +155,21 @@ async def root():
         "model": WHISPER_MODEL,
         "device": DEVICE,
         "gpu": GPU_NAME,
-        "diarization_enabled": ENABLE_DIARIZATION,
-        "version": "2.0.0",
+        "diarization_enabled": ENABLE_DIARIZATION and diarize_model is not None,
+        "version": "3.0.0",
         "docs": "/docs"
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Endpoint de santé pour vérifier que tout fonctionne."""
+    """Endpoint de santé."""
     return {
         "status": "healthy",
-        "model_loaded": whisper_model is not None,
+        "model_loaded": whisperx_model is not None,
         "device": DEVICE,
         "gpu_available": torch.cuda.is_available(),
-        "diarization_available": ENABLE_DIARIZATION
+        "diarization_available": diarize_model is not None
     }
 
 
@@ -263,46 +214,30 @@ async def transcribe_audio(
         # Mesure du temps de traitement
         start_time = time.time()
         
-        # ====== ÉTAPE 1: Transcription Whisper ======
-        logger.info(f"🎵 Transcription Whisper en cours sur {DEVICE}...")
-        whisper_result = whisper_model.transcribe(
-            temp_path,
-            language=None,
-            task="transcribe"
-        )
-        whisper_time = time.time() - start_time
-        logger.success(f"✅ Transcription Whisper terminée en {whisper_time:.2f}s")
-        
-        # ====== ÉTAPE 2: Diarisation NeMo (optionnel) ======
-        diarization_segments = []
-        diarization_time = 0
-        speakers_detected = []
-        
-        if diarize and ENABLE_DIARIZATION:
-            logger.info("🎤 Diarisation NeMo en cours...")
-            diar_start = time.time()
-            diarization_segments = run_diarization(temp_path)
-            diarization_time = time.time() - diar_start
-            speakers_detected = list(set(seg["speaker"] for seg in diarization_segments))
-            logger.success(f"✅ Diarisation terminée en {diarization_time:.2f}s - {len(speakers_detected)} locuteurs détectés")
-        
-        # ====== ÉTAPE 3: Fusion des résultats ======
-        whisper_segments = [
-            {"start": seg["start"], "end": seg["end"], "text": seg["text"]}
-            for seg in whisper_result["segments"]
-        ]
-        
-        merged_segments = merge_transcription_with_diarization(
-            whisper_segments, diarization_segments
-        )
+        # ====== TRANSCRIPTION WHISPERX ======
+        should_diarize = diarize and diarize_model is not None
+        result = transcribe_with_whisperx(temp_path, diarize=should_diarize)
         
         end_time = time.time()
         processing_time = round(end_time - start_time, 2)
         
+        # Construire le texte complet
+        full_text = " ".join(seg.get("text", "") for seg in result["segments"])
+        
+        # Formater les segments pour la réponse
+        formatted_segments = []
+        for seg in result["segments"]:
+            formatted_segments.append({
+                "speaker": seg.get("speaker", "SPEAKER_00"),
+                "start": round(seg.get("start", 0), 2),
+                "end": round(seg.get("end", 0), 2),
+                "text": seg.get("text", "").strip()
+            })
+        
         # Calcul des statistiques
-        audio_duration = whisper_result["segments"][-1]["end"] if whisper_result["segments"] else 0
-        word_count = len(whisper_result["text"].split())
-        segment_count = len(merged_segments)
+        audio_duration = formatted_segments[-1]["end"] if formatted_segments else 0
+        word_count = len(full_text.split())
+        segment_count = len(formatted_segments)
         
         # Nettoyage du fichier temporaire
         os.unlink(temp_path)
@@ -311,22 +246,20 @@ async def transcribe_audio(
         response_data = {
             "success": True,
             "filename": file.filename,
-            "language": whisper_result["language"],
-            "text": whisper_result["text"],
-            "speakers": speakers_detected if speakers_detected else ["SPEAKER_00"],
-            "segments": merged_segments,
+            "language": result["language"],
+            "text": full_text,
+            "speakers": result["speakers"],
+            "segments": formatted_segments,
             "metadata": {
                 "processing_time_seconds": processing_time,
-                "whisper_time_seconds": round(whisper_time, 2),
-                "diarization_time_seconds": round(diarization_time, 2),
                 "audio_duration_seconds": round(audio_duration, 2),
                 "file_size_bytes": file_size,
                 "file_size_mb": round(file_size / (1024 * 1024), 2),
                 "word_count": word_count,
                 "segment_count": segment_count,
-                "speaker_count": len(speakers_detected) if speakers_detected else 1,
+                "speaker_count": len(result["speakers"]),
                 "model_used": WHISPER_MODEL,
-                "diarization_enabled": diarize and ENABLE_DIARIZATION,
+                "diarization_enabled": should_diarize,
                 "device": DEVICE,
                 "gpu": GPU_NAME,
                 "speed_ratio": round(audio_duration / processing_time, 2) if processing_time > 0 else 0,
@@ -351,6 +284,8 @@ async def transcribe_audio(
         
     except Exception as e:
         logger.error(f"❌ Erreur lors de la transcription : {e}")
+        import traceback
+        traceback.print_exc()
         if 'temp_path' in locals() and os.path.exists(temp_path):
             os.unlink(temp_path)
         raise HTTPException(status_code=500, detail=str(e))
@@ -401,27 +336,25 @@ async def get_transcription(filename: str):
 async def list_models():
     """Liste les modèles disponibles et leur configuration."""
     return {
-        "whisper": {
+        "whisperx": {
             "current_model": WHISPER_MODEL,
             "device": DEVICE,
+            "compute_type": COMPUTE_TYPE,
             "gpu": GPU_NAME,
             "available_models": {
                 "tiny": {"params": "39M", "vram": "~1GB", "speed": "~32x"},
                 "base": {"params": "74M", "vram": "~1GB", "speed": "~16x"},
                 "small": {"params": "244M", "vram": "~2GB", "speed": "~6x"},
-                "medium": {"params": "769M", "vram": "~5GB", "speed": "~2x"},
-                "large": {"params": "1550M", "vram": "~10GB", "speed": "1x"},
-                "large-v2": {"params": "1550M", "vram": "~10GB", "speed": "1x"},
-                "large-v3": {"params": "1550M", "vram": "~10GB", "speed": "1x"}
+                "medium": {"params": "769M", "vram": "~3GB", "speed": "~4x"},
+                "large-v2": {"params": "1550M", "vram": "~5GB", "speed": "~2x"},
+                "large-v3": {"params": "1550M", "vram": "~5GB", "speed": "~2x"}
             }
         },
         "diarization": {
             "enabled": ENABLE_DIARIZATION,
-            "engine": "NeMo" if ENABLE_DIARIZATION else None,
-            "models": {
-                "vad": "vad_multilingual_marblenet",
-                "speaker_embedding": "titanet_large"
-            }
+            "available": diarize_model is not None,
+            "engine": "pyannote-audio" if diarize_model else None,
+            "hf_token_set": HF_TOKEN is not None
         }
     }
 
